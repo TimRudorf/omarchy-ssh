@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.timrudorf.ssh",
+  "name": "SSH",
+  "version": "1.0.0",
+  "author": "Tim Rudorf",
+  "license": "MIT",
+  "description": "Manually grant SSH access using YubiKey-authenticated OpenSSH masters.",
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "Panel.qml" },
+  "barWidget": {
+    "displayName": "SSH",
+    "description": "SSH hosts, master access and active sessions.",
+    "category": "Network",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": { "polling": true },
+    "schema": [
+      {
+        "key": "polling",
+        "type": "boolean",
+        "label": "Refresh local SSH status automatically",
+        "defaultValue": true
+      }
+    ]
+  }
+}

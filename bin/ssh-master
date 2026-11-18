@@ -1,0 +1,297 @@
+#!/usr/bin/env python3
+"""Manual OpenSSH master control and read-only status for the Omarchy widget."""
+
+import argparse
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+import fcntl
+import glob
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import stat
+import subprocess
+import sys
+
+OPEN_TAG = "ssh-master-open"
+HOST_PATTERN = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.:-]{0,252}\Z")
+CHANNEL_PATTERN = re.compile(r"^\s*#\d+ client-session \(t\d+ \[session(?:[^\]]*)\]")
+HOME = Path.home()
+
+
+class MasterError(Exception):
+    pass
+
+
+def validate_host(host):
+    if not HOST_PATTERN.fullmatch(host):
+        raise MasterError("Invalid SSH host alias.")
+    return host
+
+
+def run_ssh(args, config=None, timeout=4, env=None):
+    command = ["/usr/bin/ssh"]
+    if config:
+        command += ["-F", str(config)]
+    try:
+        return subprocess.run(
+            command + args, stdin=subprocess.DEVNULL, capture_output=True,
+            text=True, errors="replace", timeout=timeout, env=env,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise MasterError("SSH operation timed out.") from error
+
+
+def effective_config(host, config=None):
+    validate_host(host)
+    result = run_ssh(["-G", host], config)
+    if result.returncode:
+        raise MasterError(result.stderr.strip()[:1000] or "Cannot read SSH configuration.")
+    values = {}
+    for line in result.stdout.splitlines():
+        key, _, value = line.partition(" ")
+        values.setdefault(key, value)
+    return values
+
+
+def discover_hosts(config=None):
+    hosts = []
+    visited = set()
+
+    def visit(path, base, depth=0):
+        path = Path(path).expanduser()
+        if depth > 16 or path in visited or not path.is_file():
+            return
+        visited.add(path)
+        if len(visited) > 256 or path.stat().st_size > 1024 * 1024:
+            raise MasterError("SSH configuration exceeds discovery limits.")
+        for line in path.read_text().splitlines():
+            try:
+                parts = shlex.split(line, comments=True)
+            except ValueError as error:
+                raise MasterError(f"Invalid SSH configuration in {path}.") from error
+            if not parts:
+                continue
+            key = parts.pop(0)
+            if "=" in key:
+                key, value = key.split("=", 1)
+                parts.insert(0, value)
+            elif parts and parts[0] == "=":
+                parts.pop(0)
+            if key.lower() == "include":
+                for pattern in parts:
+                    pattern = Path(pattern).expanduser()
+                    if not pattern.is_absolute():
+                        pattern = base / pattern
+                    for match in sorted(glob.glob(str(pattern))):
+                        visit(match, base, depth + 1)
+            elif key.lower() == "host":
+                for host in parts:
+                    if HOST_PATTERN.fullmatch(host) and host not in hosts:
+                        hosts.append(host)
+                        if len(hosts) > 256:
+                            raise MasterError("Too many SSH host aliases (maximum 256).")
+
+    if config:
+        visit(config, HOME / ".ssh")
+    else:
+        visit(HOME / ".ssh/config", HOME / ".ssh")
+        visit("/etc/ssh/ssh_config", Path("/etc/ssh"))
+    return hosts
+
+
+def host_info(host, config=None):
+    values = effective_config(host, config)
+    socket = values.get("controlpath", "none")
+    if socket != "none":
+        socket = os.path.expanduser(socket)
+        if not os.path.isabs(socket):
+            socket = os.path.abspath(socket)
+    proxy = values.get("proxycommand", "")
+    master_only = proxy == "/usr/bin/false"
+    return {
+        "host": host, "aliases": [host], "socket": socket,
+        "destination": f'{values.get("user", "")}@{values.get("hostname", host)}:{values.get("port", "22")}',
+        "policy": "master-only" if master_only else "direct",
+    }
+
+
+def grouped_hosts(config=None):
+    groups = {}
+    errors = []
+    for host in discover_hosts(config):
+        try:
+            info = host_info(host, config)
+        except MasterError as error:
+            errors.append(f"{host}: {error}")
+            continue
+        key = info["socket"] if info["socket"] != "none" else f"host:{host}"
+        if key not in groups:
+            info["policies"] = {host: info["policy"]}
+            groups[key] = info
+        else:
+            group = groups[key]
+            group["aliases"].append(host)
+            group["policies"][host] = info["policy"]
+            if group["policy"] != info["policy"]:
+                group["policy"] = "mixed"
+    return list(groups.values()), errors
+
+
+def control(info, action, config=None):
+    if info["socket"] == "none":
+        raise MasterError("ControlPath is disabled for this host.")
+    return run_ssh(["-S", info["socket"], "-O", action, info["host"]], config)
+
+
+def session_count(output):
+    if not output.startswith("The following connections are open:"):
+        return None
+    return sum(bool(CHANNEL_PATTERN.match(line)) for line in output.splitlines())
+
+
+def status(info, config=None, sessions=True):
+    info = dict(info, state="closed", sessions=None, error="")
+    if info["socket"] == "none":
+        info.update(state="unavailable", error="ControlPath is disabled for this host.")
+        return info
+    try:
+        result = control(info, "check", config)
+        if result.returncode:
+            if Path(info["socket"]).exists() and "Connection refused" not in result.stderr:
+                info.update(state="unknown", error=result.stderr.strip()[:1000])
+            return info
+        info["state"] = "open"
+        if sessions:
+            channels = control(info, "channels", config)
+            if channels.returncode == 0:
+                info["sessions"] = session_count(channels.stdout)
+            if info["sessions"] is None:
+                info["error"] = "Session count unavailable."
+    except MasterError as error:
+        info.update(state="unknown", error=str(error))
+    return info
+
+
+@contextmanager
+def host_lock(info):
+    runtime = Path(os.environ.get("XDG_RUNTIME_DIR", HOME / ".cache")) / "ssh-master"
+    runtime.mkdir(mode=0o700, parents=True, exist_ok=True)
+    key = hashlib.sha256(info["socket"].encode()).hexdigest()
+    with (runtime / (key + ".lock")).open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise MasterError("An operation for this master is already in progress.") from error
+        yield
+
+
+def open_master(info, config=None):
+    if info["socket"] == "none":
+        raise MasterError("ControlPath is disabled for this host.")
+    with host_lock(info):
+        before = status(info, config, False)
+        if before["state"] == "open":
+            return f'{info["host"]}: master already open'
+        if before["state"] != "closed":
+            raise MasterError(before["error"] or "Cannot determine master status.")
+        socket = Path(info["socket"])
+        if socket.exists():
+            if not stat.S_ISSOCK(socket.lstat().st_mode):
+                raise MasterError("ControlPath exists but is not a socket; refusing to replace it.")
+            socket.unlink()
+        socket.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        env = dict(os.environ)
+        if not sys.stdin.isatty():
+            askpass = next((path for path in (
+                "/usr/bin/ksshaskpass", "/usr/lib/ssh/ssh-askpass",
+                "/usr/bin/lxqt-openssh-askpass",
+            ) if os.access(path, os.X_OK)), None)
+            if not askpass:
+                raise MasterError("No graphical SSH askpass found (install ksshaskpass).")
+            env.update(SSH_ASKPASS=askpass, SSH_ASKPASS_REQUIRE="force")
+        result = run_ssh([
+            "-P", OPEN_TAG, "-S", info["socket"], "-MNf",
+            "-o", "ControlPersist=yes", "-o", "ConnectTimeout=15",
+            "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=3",
+            "-o", "NumberOfPasswordPrompts=1", info["host"],
+        ], config, timeout=180, env=env)
+        if result.returncode:
+            raise MasterError(result.stderr.strip()[:2000] or "Opening master failed.")
+        if status(info, config, False)["state"] != "open":
+            raise MasterError("SSH exited without creating a usable master.")
+        return f'{info["host"]}: master opened'
+
+
+def close_master(info, config=None):
+    with host_lock(info):
+        before = status(info, config, False)
+        if before["state"] == "closed":
+            return f'{info["host"]}: master already closed; existing sessions may continue'
+        if before["state"] != "open":
+            raise MasterError(before["error"] or "Cannot determine master status.")
+        result = control(info, "stop", config)
+        if result.returncode:
+            raise MasterError(result.stderr.strip()[:1000] or "Closing master failed.")
+        return f'{info["host"]}: access closed; existing sessions may continue'
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("-F", "--config", type=Path, help="SSH configuration file")
+    sub = parser.add_subparsers(dest="command", required=True)
+    show = sub.add_parser("status", help="Read-only status; never opens or closes masters")
+    show.add_argument("host", nargs="?")
+    show.add_argument("--json", action="store_true")
+    show.add_argument("--no-sessions", action="store_true")
+    for command in ("open", "close", "check"):
+        item = sub.add_parser(command)
+        item.add_argument("host")
+    sub.add_parser("close-all", help="Stop accepting new sessions on all discovered masters")
+    args = parser.parse_args()
+    config = args.config
+    if args.command in ("open", "close", "check"):
+        info = host_info(args.host, config)
+        if args.command == "check":
+            state = status(info, config, False)
+            print(f'{args.host}: {state["state"]}')
+            return 0 if state["state"] == "open" else 1
+        print(open_master(info, config) if args.command == "open" else close_master(info, config))
+        return 0
+    if args.command == "status" and args.host:
+        hosts, errors = [host_info(args.host, config)], []
+    else:
+        hosts, errors = grouped_hosts(config)
+    if args.command == "close-all":
+        for info in hosts:
+            if info["socket"] == "none":
+                continue
+            try:
+                print(close_master(info, config))
+            except MasterError as error:
+                errors.append(f'{info["host"]}: {error}')
+        if errors:
+            raise MasterError("\n".join(errors))
+        return 0
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        rows = list(pool.map(lambda info: status(info, config, not args.no_sessions), hosts))
+    if args.json:
+        print(json.dumps({"version": 1, "hosts": rows, "errors": errors}, ensure_ascii=False))
+    else:
+        for row in rows:
+            count = "?" if row["sessions"] is None else row["sessions"]
+            print(f'{"/".join(row["aliases"])}: {row["state"]}, {count} session(s), {row["policy"]}')
+        for error in errors:
+            print(error, file=sys.stderr)
+    return 1 if errors else 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (MasterError, OSError) as error:
+        print(f"ssh-master: {error}", file=sys.stderr)
+        sys.exit(1)
