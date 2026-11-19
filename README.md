@@ -56,13 +56,15 @@ deliberately use a different configuration.
 
 ## Usage
 
-- Use the SSH icon to open or close a master, or to close all discovered masters.
+- Open the widget from the SSH icon and use a host's switch to open or close
+  its master. To close all discovered masters, use **Close all** and confirm.
 - The widget lists explicit `Host` aliases, follows `Include` files, and groups
-  aliases that share a control socket. Wildcards are rules, not listed hosts.
+  aliases that share a control socket. Hover over a host name for its aliases
+  and access policy. Wildcards are rules, not listed hosts.
 - Status refreshes locally every 10 seconds, or every 3 seconds while the panel
   is open. Turn off polling in the widget settings to stop periodic refreshes.
-- The session count excludes pure port forwarding. If OpenSSH cannot provide
-  the count, the widget shows it as unknown.
+- The session count excludes pure port forwarding and is hidden when OpenSSH
+  cannot provide it.
 
 The bundled command is also available from a terminal:
 
